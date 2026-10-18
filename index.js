@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // Mention Navigator 1.0 — Revenge clasico / Vendetta.
+  // Mention Navigator 1.1 — Revenge clasico / Vendetta. Boton @ flotante en chat.
   // Archivo ya empaquetado en el formato de expresion que carga Vendetta.
   var api = vendetta;
   var React = api.metro.common.React;
@@ -19,6 +19,13 @@
   var currentUserStore = null;
   var channelStore = null;
   var guildMemberStore = null;
+  var selectedChannelStore = null;
+  var patchCleanup = null;
+  var channelListener = null;
+  var uiSubscribers = [];
+  var pendingIds = []; // Menciones directas no visitadas, almacenadas localmente.
+  var MAX_PENDING = 150;
+  var lastChannelFromEvent = "";
 
   function debug(message, error) {
     try { console.log("[MentionNavigator] " + message, error || ""); } catch (_) {}
@@ -28,6 +35,11 @@
   }
   function redraw() {
     try { if (refresh) refresh(); } catch (_) {}
+    uiSubscribers.slice().forEach(function (fn) { try { fn(); } catch (_) {} });
+  }
+  function subscribeToUI(fn) {
+    uiSubscribers.push(fn);
+    return function () { uiSubscribers = uiSubscribers.filter(function (cb) { return cb !== fn; }); };
   }
   function getId(value) {
     if (value === undefined || value === null) return "";
@@ -51,6 +63,150 @@
       return me && getId(me.id);
     } catch (_) { return ""; }
   }
+  function getActiveChannelId() {
+    // Solo un canal seleccionado, NUNCA el del último MESSAGE_CREATE recibido.
+    try {
+      if (!selectedChannelStore && api.metro.findByStoreName)
+        selectedChannelStore = api.metro.findByStoreName("SelectedChannelStore") || null;
+      if (!selectedChannelStore) selectedChannelStore = findStore(["getChannelId", "getVoiceChannelId"]);
+      if (selectedChannelStore) {
+        var c = "";
+        if (typeof selectedChannelStore.getChannelId === "function") c = getId(selectedChannelStore.getChannelId());
+        if (c && /^\d+$/.test(c)) return c;
+        if (typeof selectedChannelStore.getLastSelectedChannelId === "function") {
+          c = getId(selectedChannelStore.getLastSelectedChannelId());
+          if (c && /^\d+$/.test(c)) return c;
+        }
+      }
+      var lastSelected = findStore(["getLastSelectedChannelId"]);
+      if (lastSelected && typeof lastSelected.getLastSelectedChannelId === "function") {
+        var id = getId(lastSelected.getLastSelectedChannelId());
+        if (/^\d+$/.test(id)) return id;
+      }
+    } catch (e) { debug("No se pudo leer el canal actual", e); }
+    return lastChannelFromEvent;
+  }
+  function getChannelIdFromProps(props) {
+    try {
+      if (!props) return "";
+      var val = props.channelId || props.channel_id || (props.channel && props.channel.id);
+      if (val && /^\d+$/.test(getId(val))) return getId(val);
+    } catch (_) {}
+    return "";
+  }
+  function getPendingForChannel(channelId) {
+    if (!channelId) return [];
+    return pendingIds.filter(function (id) {
+      return records.some(function (entry) {
+        return entry.id === id && entry.channelId === channelId && entry.type === "directa";
+      });
+    });
+  }
+  function markPending(id) {
+    id = getId(id);
+    if (pendingIds.indexOf(id) === -1) {
+      pendingIds.push(id);
+      pendingIds = pendingIds.slice(-MAX_PENDING);
+      savePending();
+    }
+  }
+  function savePending() {
+    try { storage.pendingMentions = pendingIds.slice(-MAX_PENDING); } catch (e) { debug("No se pudo guardar pendientes", e); }
+  }
+  function acknowledgeMention(id) {
+    var index = pendingIds.indexOf(getId(id));
+    if (index >= 0) {
+      pendingIds.splice(index, 1);
+      savePending();
+      redraw();
+    }
+  }
+  function jumpToPending(channelId) {
+    var ids = getPendingForChannel(channelId);
+    if (!ids.length) return;
+    // Primero la mención pendiente más antigua, así ninguna queda perdida.
+    var entry = records.find(function (r) { return r.id === ids[0] && r.channelId === channelId; });
+    if (!entry) return;
+    openMessage(entry);
+    acknowledgeMention(entry.id);
+  }
+  function MentionFloatingButton(props) {
+    var state = React.useState(0);
+    var bump = state[1];
+    React.useEffect(function () {
+      if (!running) return;
+      return subscribeToUI(function () { bump(function (n) { return n + 1; }); });
+    }, []);
+    if (!running) return null;
+    // Si Discord muestra otro chat, el botón no debe revelar menciones de un chat ajeno.
+    var channelId = getChannelIdFromProps(props) || getActiveChannelId();
+    var mentions = getPendingForChannel(channelId);
+    if (!mentions.length) return null;
+    var count = mentions.length;
+    return React.createElement(RN.View, {
+      pointerEvents: "box-none",
+      style: { position: "absolute", right: 15, bottom: 100, zIndex: 70, elevation: 15 }
+    }, React.createElement(RN.TouchableOpacity, {
+      onPress: function () { jumpToPending(channelId); },
+      activeOpacity: 0.76,
+      accessibilityRole: "button",
+      accessibilityLabel: "Ir a la siguiente mención directa de este canal",
+      style: {
+        height: 42, minWidth: 42, borderRadius: 21, paddingHorizontal: 8,
+        backgroundColor: "#5865F2", borderColor: "#B5BDFD", borderWidth: 1,
+        justifyContent: "center", alignItems: "center", flexDirection: "row",
+        shadowColor: "#000", shadowOpacity: 0.28, shadowRadius: 5,
+        shadowOffset: { width: 0, height: 2 }, elevation: 8
+      }
+    },
+      React.createElement(RN.Text, {
+        style: { color: "#FFFFFF", fontSize: 25, fontWeight: "800", lineHeight: 31, textAlign: "center" }
+      }, "@"),
+      count > 1 ? React.createElement(RN.Text, {
+        style: { color: "#FFFFFF", fontSize: 11, fontWeight: "700", marginLeft: 2 }
+      }, String(count > 99 ? "99+" : count)) : null
+    ));
+  }
+  function wrapChat(original, fallbackProps) {
+    if (!original || !React.isValidElement || !React.isValidElement(original)) return original;
+    // Rodear el chat sin alterar su lógica interna de scroll.
+    return React.createElement(RN.View, { style: { flex: 1 } },
+      original,
+      React.createElement(MentionFloatingButton, {
+        key: "mention-navigator-float", channelId: getChannelIdFromProps(fallbackProps)
+      })
+    );
+  }
+  function installChatButton() {
+    try {
+      if (!api.patcher || typeof api.patcher.after !== "function") {
+        debug("El patcher no está disponible");
+        return false;
+      }
+      var module = api.metro.findByName && api.metro.findByName("MessagesWrapperConnected", false);
+      if (module && typeof module.default === "function") {
+        patchCleanup = api.patcher.after("default", module, function (args, result) {
+          try { return wrapChat(result, args && args[0]); }
+          catch (e) { debug("Error dibujando @", e); return result; }
+        });
+        debug("Botón @ instalado en MessagesWrapperConnected");
+        return true;
+      }
+      // Compatibilidad con clientes donde el componente es una clase.
+      var wrapperModule = findStore(["MessagesWrapper"]);
+      var component = wrapperModule && wrapperModule.MessagesWrapper;
+      if (component && component.prototype && typeof component.prototype.render === "function") {
+        patchCleanup = api.patcher.after("render", component.prototype, function (args, result) {
+          try { return wrapChat(result, this && this.props); }
+          catch (e) { debug("Error dibujando @", e); return result; }
+        });
+        debug("Botón @ instalado en MessagesWrapper.render");
+        return true;
+      }
+    } catch (e) { debug("No se pudo instalar el botón flotante", e); }
+    return false;
+  }
+
   function getChannel(id) {
     try {
       if (!channelStore) channelStore = findStore(["getChannel"]);
@@ -112,6 +268,14 @@
   }
   function save() {
     try { storage.items = records.slice(0, LIMIT); } catch (e) { debug("No se pudo guardar el historial", e); }
+    // Los registros eliminados al llegar a 150 ya no deben mostrarse pendientes.
+    var ids = {};
+    records.forEach(function (r) { ids[r.id] = true; });
+    var remaining = pendingIds.filter(function (id) { return ids[id]; });
+    if (remaining.length !== pendingIds.length) {
+      pendingIds = remaining;
+      savePending();
+    }
   }
   function handleMessage(event) {
     if (!running) return;
@@ -126,6 +290,9 @@
       }
       records.unshift(entry);
       if (records.length > LIMIT) records.length = LIMIT;
+      // Solo @menciones directas activan el flotante; no roles ni @everyone.
+      // Una edición no reactivará una mención ya visitada.
+      if (entry.type === "directa" && existing === -1) markPending(entry.id);
       save();
       redraw();
     } catch (e) { debug("No se pudo procesar la mencion", e); }
@@ -193,6 +360,8 @@
   }
   function eraseHistory() {
     records = [];
+    pendingIds = [];
+    savePending();
     currentId = null;
     save();
     redraw();
@@ -282,11 +451,11 @@
       contentContainerStyle: { padding: 16, paddingBottom: 55 }
     },
       Text("MENTION NAVIGATOR", { fontSize: 22, fontWeight: "800", marginTop: 5 }),
-      Text("Historial de menciones | Revenge clásico", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
+      Text("Historial de menciones | Botón @ en el chat", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
       React.createElement(RN.View, { style: { backgroundColor: "#222630", borderRadius: 12, padding: 12, marginBottom: 12 } },
         Text(status, { color: running && listener ? "#80e9b2" : "#ffcb80", fontWeight: "700" }),
         Text(records.length + " menciones guardadas de " + LIMIT + " posibles", { marginTop: 4, color: "#c9cbda" }),
-        Text("Solo registra menciones nuevas mientras Discord recibe eventos con el plugin activo.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 })
+        Text("Si te mencionan directamente, aparece @ en ese chat. Pulsarlo te lleva a la mención pendiente.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 })
       ),
       React.createElement(RN.TextInput, {
         value: query, onChangeText: setQuery, placeholder: "Buscar usuario, texto o canal...",
@@ -313,6 +482,9 @@
       running = true;
       currentId = getMyId();
       records = safeRecords(storage.items);
+      pendingIds = Array.isArray(storage.pendingMentions) ? storage.pendingMentions.filter(function (id) {
+        return /^\d+$/.test(getId(id)) && records.some(function (r) { return r.id === getId(id) && r.type === "directa"; });
+      }).map(getId).slice(-MAX_PENDING) : [];
       try {
         dispatcher = api.metro.common.FluxDispatcher || findStore(["subscribe", "unsubscribe", "dispatch"]);
         if (!dispatcher || typeof dispatcher.subscribe !== "function" || typeof dispatcher.unsubscribe !== "function") {
@@ -323,12 +495,24 @@
         updateListener = function (event) { handleMessage(event); };
         dispatcher.subscribe("MESSAGE_CREATE", listener);
         dispatcher.subscribe("MESSAGE_UPDATE", updateListener);
+        channelListener = function (event) {
+          try {
+            var id = getId(event && (event.channelId || event.channel_id));
+            if (/^\d+$/.test(id)) lastChannelFromEvent = id;
+            redraw();
+          } catch (_) {}
+        };
+        try { dispatcher.subscribe("CHANNEL_SELECT", channelListener); } catch (_) {}
         status = "Escuchando menciones nuevas";
+        var patched = installChatButton();
+        status += patched ? " | Botón @ habilitado" : " | Botón @ incompatible en esta versión";
       } catch (e) {
         status = "Error iniciando detector de menciones";
         debug(status, e);
         try { if (dispatcher && listener) dispatcher.unsubscribe("MESSAGE_CREATE", listener); } catch (_) {}
         try { if (dispatcher && updateListener) dispatcher.unsubscribe("MESSAGE_UPDATE", updateListener); } catch (_) {}
+        try { if (dispatcher && channelListener) dispatcher.unsubscribe("CHANNEL_SELECT", channelListener); } catch (_) {}
+        if (patchCleanup) { try { patchCleanup(); } catch (_) {} patchCleanup = null; }
         listener = null;
         updateListener = null;
       }
@@ -338,6 +522,12 @@
       running = false;
       try { if (dispatcher && listener) dispatcher.unsubscribe("MESSAGE_CREATE", listener); } catch (_) {}
       try { if (dispatcher && updateListener) dispatcher.unsubscribe("MESSAGE_UPDATE", updateListener); } catch (_) {}
+      try { if (dispatcher && channelListener) dispatcher.unsubscribe("CHANNEL_SELECT", channelListener); } catch (_) {}
+      if (patchCleanup) { try { patchCleanup(); } catch (_) {} patchCleanup = null; }
+      uiSubscribers = [];
+      channelListener = null;
+      lastChannelFromEvent = "";
+      selectedChannelStore = null;
       dispatcher = null;
       listener = null;
       updateListener = null;

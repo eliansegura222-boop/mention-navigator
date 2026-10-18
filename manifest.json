@@ -1,6 +1,6 @@
 {
   "name": "Mention Navigator",
-  "description": "Historial local de menciones nuevas con filtros, busqueda y acceso al mensaje original. Para Revenge clasico (Android).",
+  "description": "Historial de menciones y boton flotante @ para menciones directas en el chat activo. Revenge clasico.",
   "authors": [
     {
       "name": "Community",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_24px"
   },
-  "hash": "a6d35213f3879b1c449c332fcc0ace0411310bf8c28811149e1c81ea55f400cb"
+  "hash": "83f05bac6d87682394b2b72c3002fd4a1c9c9f15558b3c40479e575dc3e0ec82"
 }
