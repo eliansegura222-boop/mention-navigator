@@ -1,6 +1,6 @@
 {
   "name": "Mention Navigator",
-  "description": "Historial de menciones y boton @ en el chat activo, con diagnostico y prueba. Revenge clasico v1.2.",
+  "description": "Historial de menciones con comando privado /direct para abrir la mencion directa de este canal. Revenge clasico v1.3.",
   "authors": [
     {
       "name": "Community",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_24px"
   },
-  "hash": "f282bfc8ac8eb8376f5ded2febe01b7ecd9dee0c46f498a92a80a56b810fe40e"
+  "hash": "46cc73385abb9fbb101644f2033928790d9c2008a54037f7fa2ad06e5061abac"
 }
