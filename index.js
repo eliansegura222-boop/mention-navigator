@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // Mention Navigator 1.3 — Revenge clasico / Vendetta. Comando local /direct.
+  // Mention Navigator v1.4 — Comando local BUILT_IN /direct, sin interfaz flotante.
   // Archivo ya empaquetado en el formato de expresion que carga Vendetta.
   var api = vendetta;
   var React = api.metro.common.React;
@@ -21,7 +21,9 @@
   var guildMemberStore = null;
   var selectedChannelStore = null;
   var removeDirectCommand = null;
-  var commandStatus = "No registrado";
+  var commandStatus = "Preparando /direct...";
+  var commandRetry = null;
+  var attempts = 0;
   var lastJumpByChannel = Object.create(null);
 
   function debug(message, error) {
@@ -231,15 +233,15 @@
     }
   }
   function registerDirectCommand() {
-    if (!api.commands || typeof api.commands.registerCommand !== "function") {
-      commandStatus = "Tu versión de Revenge no expone comandos locales";
-      debug(commandStatus);
-      return;
-    }
+    if (!running || removeDirectCommand) return;
+    attempts++;
     try {
-      // BUILT_IN = 0: ejecución sólo en el dispositivo.
-      // Nunca devolver { content } ni llamar a sendMessage.
-      removeDirectCommand = api.commands.registerCommand({
+      if (!api.commands || typeof api.commands.registerCommand !== "function") {
+        throw new Error("API de comandos no disponible");
+      }
+      // Vendetta: ApplicationCommandType.CHAT = 1, InputType.BUILT_IN = 0.
+      // El callback no envia mensajes ni devuelve contenido.
+      var unregister = api.commands.registerCommand({
         name: "direct",
         displayName: "direct",
         description: "Ir a una mención directa guardada en este chat (local)",
@@ -262,12 +264,18 @@
           return;
         }
       });
-      commandStatus = "Comando /direct disponible (local)";
+      if (typeof unregister !== "function") throw new Error("Registro sin funcion de desregistro");
+      removeDirectCommand = unregister;
+      commandStatus = "/direct registrado como BUILT-IN (local)";
+      debug(commandStatus);
     } catch (error) {
-      removeDirectCommand = null;
-      commandStatus = "No se pudo registrar /direct en esta versión";
+      commandStatus = "No se pudo registrar /direct (intento " + attempts + ")";
       debug(commandStatus, error);
+      if (running && attempts < 5 && typeof setTimeout === "function") {
+        commandRetry = setTimeout(function () { commandRetry = null; registerDirectCommand(); }, 1500);
+      }
     }
+    redraw();
   }
 
   function eraseHistory() {
@@ -362,12 +370,12 @@
       contentContainerStyle: { padding: 16, paddingBottom: 55 }
     },
       Text("MENTION NAVIGATOR", { fontSize: 22, fontWeight: "800", marginTop: 5 }),
-      Text("Historial de menciones | Comando local /direct (v1.3)", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
+      Text("VERSION 1.4 | Comando BUILT-IN /direct", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
       React.createElement(RN.View, { style: { backgroundColor: "#222630", borderRadius: 12, padding: 12, marginBottom: 12 } },
         Text(status, { color: running && listener ? "#80e9b2" : "#ffcb80", fontWeight: "700" }),
         Text(records.length + " menciones guardadas de " + LIMIT + " posibles", { marginTop: 4, color: "#c9cbda" }),
         Text(commandStatus, { marginTop: 4, color: removeDirectCommand ? "#80e9b2" : "#ffcb80", fontSize: 12 }),
-        Text("Escribe /direct en un chat y selecciona el comando sugerido. Abre la mención directa más reciente de ese canal; repítelo para las anteriores. No envía mensajes.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 }),
+        Text("En un chat, escribe /direct y selecciónalo en la lista Built-in. Abre la mención directa más reciente de ese mismo canal. No envía mensajes.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 }),
         Text("Solo registra menciones nuevas mientras Discord recibe eventos con el plugin activo.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 })
       ),
       React.createElement(RN.TextInput, {
@@ -396,8 +404,7 @@
       currentId = getMyId();
       records = safeRecords(storage.items);
       lastJumpByChannel = Object.create(null);
-      // Los datos sobrantes de la antigua interfaz flotante ya no se usan.
-      try { delete storage.pendingMentions; delete storage.testChatButton; } catch (_) {}
+      attempts = 0;
       registerDirectCommand();
       try {
         dispatcher = api.metro.common.FluxDispatcher || findStore(["subscribe", "unsubscribe", "dispatch"]);
@@ -422,10 +429,16 @@
     },
     onUnload: function () {
       running = false;
+      if (commandRetry !== null && typeof clearTimeout === "function") {
+        try { clearTimeout(commandRetry); } catch (_) {}
+      }
+      commandRetry = null;
       if (typeof removeDirectCommand === "function") {
         try { removeDirectCommand(); } catch (e) { debug("Error quitando /direct", e); }
       }
       removeDirectCommand = null;
+      commandStatus = "Desactivado";
+      attempts = 0;
       lastJumpByChannel = Object.create(null);
       selectedChannelStore = null;
       try { if (dispatcher && listener) dispatcher.unsubscribe("MESSAGE_CREATE", listener); } catch (_) {}
