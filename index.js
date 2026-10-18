@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // Mention Navigator 1.1 — Revenge clasico / Vendetta. Boton @ flotante en chat.
+  // Mention Navigator 1.2 — Revenge clasico / Vendetta. Boton @ flotante en chat.
   // Archivo ya empaquetado en el formato de expresion que carga Vendetta.
   var api = vendetta;
   var React = api.metro.common.React;
@@ -20,7 +20,12 @@
   var channelStore = null;
   var guildMemberStore = null;
   var selectedChannelStore = null;
-  var patchCleanup = null;
+  var patchCleanups = [];
+  var patchTargets = [];
+  var renderCount = 0;
+  var overlayError = "";
+  var previewEnabled = false;
+  var lastPatchedAt = 0;
   var channelListener = null;
   var uiSubscribers = [];
   var pendingIds = []; // Menciones directas no visitadas, almacenadas localmente.
@@ -127,8 +132,7 @@
     // Primero la mención pendiente más antigua, así ninguna queda perdida.
     var entry = records.find(function (r) { return r.id === ids[0] && r.channelId === channelId; });
     if (!entry) return;
-    openMessage(entry);
-    acknowledgeMention(entry.id);
+    if (openMessage(entry)) acknowledgeMention(entry.id);
   }
   function MentionFloatingButton(props) {
     var state = React.useState(0);
@@ -141,19 +145,22 @@
     // Si Discord muestra otro chat, el botón no debe revelar menciones de un chat ajeno.
     var channelId = getChannelIdFromProps(props) || getActiveChannelId();
     var mentions = getPendingForChannel(channelId);
-    if (!mentions.length) return null;
+    if (!mentions.length && !previewEnabled) return null;
     var count = mentions.length;
     return React.createElement(RN.View, {
       pointerEvents: "box-none",
       style: { position: "absolute", right: 15, bottom: 100, zIndex: 70, elevation: 15 }
     }, React.createElement(RN.TouchableOpacity, {
-      onPress: function () { jumpToPending(channelId); },
+      onPress: function () {
+        if (mentions.length) jumpToPending(channelId);
+        else toast("El botón @ se dibuja correctamente. Espera una mención directa nueva.");
+      },
       activeOpacity: 0.76,
       accessibilityRole: "button",
       accessibilityLabel: "Ir a la siguiente mención directa de este canal",
       style: {
         height: 42, minWidth: 42, borderRadius: 21, paddingHorizontal: 8,
-        backgroundColor: "#5865F2", borderColor: "#B5BDFD", borderWidth: 1,
+        backgroundColor: previewEnabled && !count ? "#5E6778" : "#5865F2", borderColor: "#B5BDFD", borderWidth: 1,
         justifyContent: "center", alignItems: "center", flexDirection: "row",
         shadowColor: "#000", shadowOpacity: 0.28, shadowRadius: 5,
         shadowOffset: { width: 0, height: 2 }, elevation: 8
@@ -169,42 +176,128 @@
   }
   function wrapChat(original, fallbackProps) {
     if (!original || !React.isValidElement || !React.isValidElement(original)) return original;
-    // Rodear el chat sin alterar su lógica interna de scroll.
-    return React.createElement(RN.View, { style: { flex: 1 } },
-      original,
-      React.createElement(MentionFloatingButton, {
-        key: "mention-navigator-float", channelId: getChannelIdFromProps(fallbackProps)
-      })
-    );
+    // No envolver dos veces el mismo chat aunque lo encuentre mas de una estrategia.
+    if (original.props && original.props.__mentionNavigatorChatRoot) return original;
+    try {
+      renderCount++;
+      lastPatchedAt = Date.now();
+      var channelId = getChannelIdFromProps(fallbackProps) || getActiveChannelId();
+      if (!channelId || !/^\d+$/.test(channelId)) return original;
+      return React.createElement(RN.View, {
+        __mentionNavigatorChatRoot: true,
+        collapsable: false,
+        style: { flex: 1, position: "relative" }
+      }, original, React.createElement(MentionFloatingButton, {
+        key: "mention-navigator-at-button",
+        channelId: channelId
+      }));
+    } catch (e) {
+      overlayError = String(e && e.message || e);
+      debug("Error al dibujar el boton @", e);
+      return original;
+    }
+  }
+  function registerPatch(cleanup, targetName) {
+    if (typeof cleanup !== "function") return false;
+    patchCleanups.push(cleanup);
+    patchTargets.push(targetName);
+    debug("Boton @ conectado a " + targetName);
+    return true;
+  }
+  function tryPatch(target, key, name) {
+    if (!target || typeof target[key] !== "function") return false;
+    try {
+      return registerPatch(api.patcher.after(key, target, function (args, result, self) {
+        return wrapChat(result, args && args[0] || self && self.props);
+      }), name);
+    } catch (e) { debug("No se pudo interceptar " + name, e); return false; }
   }
   function installChatButton() {
+    if (!api.patcher || typeof api.patcher.after !== "function") {
+      overlayError = "Revenge no expone la API patcher.after";
+      return false;
+    }
+    var metro = api.metro;
+    var successes = 0;
+    var seenTargets = [];
+    function patchOne(obj, key, name) {
+      if (!obj || seenTargets.some(function (o) { return o.obj === obj && o.key === key; })) return false;
+      seenTargets.push({ obj: obj, key: key });
+      if (tryPatch(obj, key, name)) { successes++; return true; }
+      return false;
+    }
+    function patchComponent(comp, name) {
+      if (!comp) return;
+      var val = comp.default || comp;
+      if (val.prototype && typeof val.prototype.render === "function") {
+        patchOne(val.prototype, "render", name + ".render"); return;
+      }
+      if (val.type && val.type.prototype && typeof val.type.prototype.render === "function") {
+        patchOne(val.type.prototype, "render", name + ".type.render"); return;
+      }
+      if (typeof val.render === "function") { patchOne(val, "render", name + ".render"); return; }
+      if (val.type && typeof val.type.render === "function") {
+        patchOne(val.type, "render", name + ".type.render");
+      }
+    }
+    // El componente antiguo que usa la funcion de fondo de chat de Vendetta.
     try {
-      if (!api.patcher || typeof api.patcher.after !== "function") {
-        debug("El patcher no está disponible");
-        return false;
+      var mod = metro.findByProps && metro.findByProps("MessagesWrapper");
+      if (mod && mod.MessagesWrapper) patchComponent(mod.MessagesWrapper, "MessagesWrapper");
+    } catch (e) { debug("MessagesWrapper no disponible", e); }
+    try {
+      var connected = metro.findByName && metro.findByName("MessagesWrapperConnected", false);
+      if (connected && typeof connected.default === "function") {
+        patchOne(connected, "default", "MessagesWrapperConnected.default");
       }
-      var module = api.metro.findByName && api.metro.findByName("MessagesWrapperConnected", false);
-      if (module && typeof module.default === "function") {
-        patchCleanup = api.patcher.after("default", module, function (args, result) {
-          try { return wrapChat(result, args && args[0]); }
-          catch (e) { debug("Error dibujando @", e); return result; }
+    } catch (e) { debug("MessagesWrapperConnected no disponible", e); }
+    // En Discord moderno el nombre de la funcion a menudo esta en .type.name
+    // y NO en el export default de Metro. Buscar ambas representaciones.
+    var candidates = ["MessagesWrapper", "MessagesWrapperConnected", "ChatView", "ChannelChatView", "ChannelChat"];
+    ["findByTypeNameAll", "findByDisplayNameAll", "findByNameAll"].forEach(function (finder) {
+      if (typeof metro[finder] !== "function") return;
+      candidates.forEach(function (name) {
+        try {
+          [true, false].forEach(function (exportIsDefault) {
+            var results = metro[finder](name, exportIsDefault);
+            if (!results) return;
+            if (!Array.isArray(results)) results = [results];
+            results.slice(0, 10).forEach(function (item) {
+              patchComponent(exportIsDefault ? item : item.default || item, name + " (" + finder + ")");
+              if (!exportIsDefault && item && typeof item.default === "function") {
+                patchOne(item, "default", name + ".default (" + finder + ")");
+              }
+            });
+          });
+        } catch (_) {}
+      });
+    });
+    // Ultimo recurso: JSX usa con frecuencia React.createElement para crear
+    // la raiz del chat aunque Metro ya haya importado las funciones del modulo.
+    // Solo se interceptan elementos con nombres conocidos; no todos los Views.
+    if (!successes && typeof React.createElement === "function") {
+      try {
+        var names = { MessagesWrapperConnected: true, MessagesWrapper: true,
+          ChatView: true, ChannelChatView: true, ChannelChat: true };
+        var unpatch = api.patcher.after("createElement", React, function (args, result) {
+          try {
+            var type = args && args[0];
+            var name = type && (type.displayName || type.name || type.type && (type.type.displayName || type.type.name)
+              || type.render && (type.render.displayName || type.render.name));
+            if (!name || !names[name]) return result;
+            return wrapChat(result, args[1]);
+          } catch (_) { return result; }
         });
-        debug("Botón @ instalado en MessagesWrapperConnected");
-        return true;
-      }
-      // Compatibilidad con clientes donde el componente es una clase.
-      var wrapperModule = findStore(["MessagesWrapper"]);
-      var component = wrapperModule && wrapperModule.MessagesWrapper;
-      if (component && component.prototype && typeof component.prototype.render === "function") {
-        patchCleanup = api.patcher.after("render", component.prototype, function (args, result) {
-          try { return wrapChat(result, this && this.props); }
-          catch (e) { debug("Error dibujando @", e); return result; }
-        });
-        debug("Botón @ instalado en MessagesWrapper.render");
-        return true;
-      }
-    } catch (e) { debug("No se pudo instalar el botón flotante", e); }
-    return false;
+        if (registerPatch(unpatch, "React.createElement (respaldo)")) successes++;
+      } catch (e) { debug("Respaldo de React.createElement no disponible", e); }
+    }
+    if (!successes) overlayError = "No se encontro un componente de chat compatible";
+    return successes > 0;
+  }
+  function removeChatButton() {
+    patchCleanups.splice(0).reverse().forEach(function (fn) { try { fn(); } catch (_) {} });
+    patchTargets = [];
+    renderCount = 0;
   }
 
   function getChannel(id) {
@@ -451,12 +544,22 @@
       contentContainerStyle: { padding: 16, paddingBottom: 55 }
     },
       Text("MENTION NAVIGATOR", { fontSize: 22, fontWeight: "800", marginTop: 5 }),
-      Text("Historial de menciones | Botón @ en el chat", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
+      Text("Historial de menciones | Botón @ en el chat (v1.2)", { color: "#a9acb9", marginTop: 3, marginBottom: 14 }),
       React.createElement(RN.View, { style: { backgroundColor: "#222630", borderRadius: 12, padding: 12, marginBottom: 12 } },
         Text(status, { color: running && listener ? "#80e9b2" : "#ffcb80", fontWeight: "700" }),
         Text(records.length + " menciones guardadas de " + LIMIT + " posibles", { marginTop: 4, color: "#c9cbda" }),
-        Text("Si te mencionan directamente, aparece @ en ese chat. Pulsarlo te lleva a la mención pendiente.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 })
+        Text("Conexiones UI: " + (patchTargets.length ? patchTargets.join(", ") : "ninguna"), { marginTop: 6, color: "#b2b5c1", fontSize: 11 }),
+      Text("Render del chat detectado: " + renderCount + " | Canal: " + (getActiveChannelId() || "desconocido"), { marginTop: 4, color: "#b2b5c1", fontSize: 11 }),
+      Text("Menciones directas pendientes aqui: " + getPendingForChannel(getActiveChannelId()).length, { marginTop: 4, color: "#b2b5c1", fontSize: 11 }),
+      overlayError ? Text("Diagnostico: " + overlayError, { marginTop: 4, color: "#f7b1b1", fontSize: 11 }) : null,
+      Text("El boton @ aparece sobre la flecha de bajar cuando hay una mencion directa nueva.", { marginTop: 8, color: "#b2b5c1", fontSize: 12 })
       ),
+      Button(previewEnabled ? "DESACTIVAR PRUEBA DE @" : "PROBAR BOTON @ EN EL CHAT", function () {
+        previewEnabled = !previewEnabled;
+        try { storage.testChatButton = previewEnabled; } catch (_) {}
+        redraw();
+        toast(previewEnabled ? "Regresa a un chat. El @ de prueba debe aparecer." : "Prueba @ desactivada");
+      }, false, "secondary"),
       React.createElement(RN.TextInput, {
         value: query, onChangeText: setQuery, placeholder: "Buscar usuario, texto o canal...",
         placeholderTextColor: "#999caa", autoCapitalize: "none", autoCorrect: false,
@@ -482,6 +585,7 @@
       running = true;
       currentId = getMyId();
       records = safeRecords(storage.items);
+      previewEnabled = !!storage.testChatButton;
       pendingIds = Array.isArray(storage.pendingMentions) ? storage.pendingMentions.filter(function (id) {
         return /^\d+$/.test(getId(id)) && records.some(function (r) { return r.id === getId(id) && r.type === "directa"; });
       }).map(getId).slice(-MAX_PENDING) : [];
@@ -512,7 +616,7 @@
         try { if (dispatcher && listener) dispatcher.unsubscribe("MESSAGE_CREATE", listener); } catch (_) {}
         try { if (dispatcher && updateListener) dispatcher.unsubscribe("MESSAGE_UPDATE", updateListener); } catch (_) {}
         try { if (dispatcher && channelListener) dispatcher.unsubscribe("CHANNEL_SELECT", channelListener); } catch (_) {}
-        if (patchCleanup) { try { patchCleanup(); } catch (_) {} patchCleanup = null; }
+        removeChatButton();
         listener = null;
         updateListener = null;
       }
@@ -523,7 +627,7 @@
       try { if (dispatcher && listener) dispatcher.unsubscribe("MESSAGE_CREATE", listener); } catch (_) {}
       try { if (dispatcher && updateListener) dispatcher.unsubscribe("MESSAGE_UPDATE", updateListener); } catch (_) {}
       try { if (dispatcher && channelListener) dispatcher.unsubscribe("CHANNEL_SELECT", channelListener); } catch (_) {}
-      if (patchCleanup) { try { patchCleanup(); } catch (_) {} patchCleanup = null; }
+      removeChatButton();
       uiSubscribers = [];
       channelListener = null;
       lastChannelFromEvent = "";
